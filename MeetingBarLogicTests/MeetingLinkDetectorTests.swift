@@ -156,6 +156,44 @@ final class MeetingLinkDetectorTests: XCTestCase {
         }
     }
 
+    func testDetectsZoomGovLinkWithPassword() {
+        // ZoomGov (`zoomgov.com`) is the same Zoom product hosted for government
+        // accounts, so its join URL has Zoom's `/j/<meetingID>?pwd=<hash>` shape
+        // and password encoding. The hash commonly carries `-`, `_`, `.`, `+`,
+        // and `/`; the original path class `[a-zA-Z0-9?&=]+` stopped at the first
+        // such character, handing the browser a truncated `pwd=` that Zoom
+        // rejected as a wrong/missing password.
+        let urls = [
+            "https://www.zoomgov.com/j/16111111111?pwd=abc-DEF123-GHI",
+            "https://www.zoomgov.com/j/16111111111?pwd=abc_DEF.123",
+            "https://www.zoomgov.com/j/16111111111?pwd=abc+DEF/123",
+            "https://www.zoomgov.com/j/16111111111?pwd=abcdef123"
+        ]
+
+        for url in urls {
+            let link = detectMeetingLink(url)
+
+            XCTAssertEqual(link?.service, .zoomgov, url)
+            XCTAssertEqual(link?.url.absoluteString, url, url)
+        }
+    }
+
+    func testDetectsZoomGovLinkWithoutPassword() {
+        let url = "https://www.zoomgov.com/j/1234567890"
+        let link = detectMeetingLink(url)
+
+        XCTAssertEqual(link?.service, .zoomgov)
+        XCTAssertEqual(link?.url.absoluteString, url)
+    }
+
+    func testDoesNotMatchNonMeetingZoomGovPages() {
+        // A bare `/j/` with no meeting id is not a real join link and must not
+        // match — mirrors the Zhumu guard in testDoesNotMatchNonMeetingZhumuPages.
+        let url = "https://www.zoomgov.com/j/"
+
+        XCTAssertNil(detectMeetingLink(url), url)
+    }
+
     func testDetectsCustomRegexLinkFromNotes() {
         let link = MeetingLinkDetector.detect(
             location: nil,
