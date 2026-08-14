@@ -193,12 +193,33 @@ private let meetingLinkRegexes: [MeetingServices: NSRegularExpression] =
 private let outlookSafeLinkRegex = try? NSRegularExpression(
     pattern: #"https://[\S]+\.safelinks\.protection\.outlook\.com/[\S]+url=([\S]*)"#)
 
+/// Matches Google's `google.<tld>/url?q=<percent-encoded target>` redirect
+/// together with the tracking parameters Google appends after it, whether they
+/// arrive as `&` or as the HTML entity `&amp;`.
+///
+/// The capture group is the encoded target only, which ends at the first `&`.
+/// Because the target is *fully* percent-encoded, every `&` after `q=` belongs
+/// to Google rather than to the target — so the pattern consumes any trailing
+/// `name=value` pair rather than an allow-list of known ones. An unrecognised
+/// parameter would otherwise be left glued onto the unwrapped URL, which both
+/// defeats the string-identity dedupe in `MeetingLinkCandidatePolicy.ranked`
+/// and changes the URL any downstream exact comparison sees.
+///
+/// The host is matched across country domains (`google.de`, `google.co.uk`),
+/// with or without `www.`, because Calendar renders the redirect under the
+/// viewer's Google domain. It stays `https`-only and requires `q` to be the
+/// first parameter, which is what Calendar emits;
+/// `testHostAndSchemeBoundariesAreNotRewritten` records those boundaries.
+private let googleRedirectRegex = try? NSRegularExpression(
+    pattern: #"https://(?:www\.)?google\.[a-z]{2,}(?:\.[a-z]{2,})?/url\?q=([^\s&"'<>]+)"#
+        + #"(?:&(?:amp;)?[A-Za-z][A-Za-z0-9_]*=[^\s&"'<>]*)*"#)
+
 func regex(for service: MeetingServices) -> NSRegularExpression? {
     meetingLinkRegexes[service]
 }
 
 func detectMeetingLink(_ rawText: String, customRegexes: [String] = []) -> MeetingLink? {
-    let text = cleanupOutlookSafeLinks(rawText: rawText)
+    let text = cleanupGoogleRedirects(rawText: cleanupOutlookSafeLinks(rawText: rawText))
 
     for pattern in customRegexes {
         if let regex = try? NSRegularExpression(pattern: pattern),
@@ -267,6 +288,92 @@ func cleanupOutlookSafeLinks(rawText: String) -> String {
         }
     }
     return text
+}
+
+/// Rewrites Google Calendar's `google.<tld>/url?q=…` redirects in `rawText`
+/// back to their real targets, so detection sees the underlying meeting URL.
+///
+/// When Calendar renders an invite body it wraps links in this redirect with
+/// the target percent-encoded, so `?pwd=X` becomes `?pwd%3DX`. For a link the
+/// organiser typed into the body, Calendar emits both forms — plain and
+/// wrapped — and the wrapped one is *longer*, so it wins
+/// `MeetingLinkCandidatePolicy`'s length tie-break. Its `pwd` is then not a
+/// query parameter at all but part of one valueless parameter name, so no
+/// passcode reaches Zoom and the client prompts for one the invite supplied.
+/// Links Calendar generates itself, such as the add-on's "Joining
+/// instructions", appear wrapped only; those never had a plain form to lose to.
+///
+/// Every match is rewritten in a single pass, so `maxNestingDepth` bounds
+/// *nesting depth* — a redirect whose target is itself a redirect — rather than
+/// how many links a body may contain. An earlier version rewrote one match per pass,
+/// which silently left the tail of a link-heavy invite wrapped.
+///
+/// An undecodable `%` escape skips that match and leaves it as-is; it must not
+/// abort the pass, or one malformed link anywhere earlier in the body would
+/// reinstate the bug for the meeting link after it.
+func cleanupGoogleRedirects(rawText: String) -> String {
+    guard let googleRedirectRegex else { return rawText }
+
+    var text = rawText
+    autoreleasepool {
+        // Bounds nesting depth. The loop must make forward progress on every
+        // iteration or it spins: `rewritingRedirects` returns nil once no
+        // redirects remain (the usual exit) or when no match decoded
+        // successfully, and otherwise the text strictly shrinks —
+        // unwrapping removes a prefix and percent-decoding never lengthens.
+        let maxNestingDepth = 32
+        for _ in 0 ..< maxNestingDepth {
+            guard let rewritten = rewritingRedirects(in: text, using: googleRedirectRegex) else {
+                break
+            }
+            text = rewritten
+        }
+    }
+    return text
+}
+
+/// One rewrite pass: splices every decodable redirect in `text` with its
+/// decoded target, returning nil when nothing changed.
+///
+/// Builds the result by appending segments rather than mutating in place —
+/// `String.Index` values from the match list are only valid against the string
+/// they were computed from, and a global `replacingOccurrences` of the matched
+/// text would rewrite inside a longer wrapper that happens to start with it.
+private func rewritingRedirects(
+    in text: String,
+    using regex: NSRegularExpression
+) -> String? {
+    let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+    guard !matches.isEmpty else { return nil }
+
+    var result = ""
+    var copiedUpTo = text.startIndex
+    var didRewrite = false
+
+    for match in matches {
+        guard let fullRange = Range(match.range, in: text),
+              let targetRange = Range(match.range(at: 1), in: text),
+              // Upholds the slicing invariant below rather than guarding a
+              // diagnosed case: `matches` is non-overlapping and ascending, so
+              // this holds today. If that ever stopped being true the slice
+              // `text[copiedUpTo ..< fullRange.lowerBound]` would trap.
+              fullRange.lowerBound >= copiedUpTo
+        else { continue }
+
+        // Skip, don't abort: a malformed escape here must not strand the
+        // redirects after it.
+        guard let decodedTarget = String(text[targetRange]).removingPercentEncoding
+        else { continue }
+
+        result += text[copiedUpTo ..< fullRange.lowerBound]
+        result += decodedTarget
+        copiedUpTo = fullRange.upperBound
+        didRewrite = true
+    }
+
+    guard didRewrite else { return nil }
+    result += text[copiedUpTo...]
+    return result == text ? nil : result
 }
 
 func getMatch(text: String, regex: NSRegularExpression) -> String? {
@@ -462,9 +569,18 @@ enum MeetingLinkDetector {
         // 6. Custom regex fallback over combined text. Lowest priority so a
         //    custom regex cannot override a real provider conference URL.
         if !customRegexes.isEmpty {
-            let combined = [location, eventURL?.absoluteString, notes]
-                .compactMap { $0 }
-                .joined(separator: "\n")
+            // Same cleanups as `builtInCandidates`. Without them a custom regex
+            // — used precisely for hosts the built-in catalogue does not know —
+            // matches the wrapped redirect and yields a URL whose `pwd` cannot
+            // be parsed. That candidate is also what the "open with another
+            // link" menu and the preferences regex tester display.
+            let combined = cleanupGoogleRedirects(
+                rawText: cleanupOutlookSafeLinks(
+                    rawText: [location, eventURL?.absoluteString, notes]
+                        .compactMap { $0 }
+                        .joined(separator: "\n")
+                )
+            )
             if let detected = detectCustomRegexLink(text: combined, patterns: customRegexes) {
                 candidates.append(MeetingLinkCandidate(
                     url: detected.url,
@@ -481,7 +597,7 @@ enum MeetingLinkDetector {
         in rawText: String,
         source: MeetingLinkSource
     ) -> [MeetingLinkCandidate] {
-        let text = cleanupOutlookSafeLinks(rawText: rawText)
+        let text = cleanupGoogleRedirects(rawText: cleanupOutlookSafeLinks(rawText: rawText))
         guard text.contains("://") else { return [] }
 
         let range = NSRange(text.startIndex..., in: text)
