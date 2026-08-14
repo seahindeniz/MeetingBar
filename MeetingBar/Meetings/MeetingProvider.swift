@@ -244,7 +244,7 @@ extension MeetingProvider {
                 .teams,
                 icon: "ms_teams_icon",
                 pattern:
-                    #"https?://(gov\.)?teams\.microsoft\.(com|us)/(l/meetup-join/[a-zA-Z0-9_%\/=\-\+\.?]+(?:&[^\s]+)?|meet/\d+\?p=[A-Za-z0-9_\-]+(?:&[^\s]+)?)"#,
+                    #"https?://((gov\.)?teams\.microsoft\.(com|us)|teams\.live\.com)/(l/meetup-join/[a-zA-Z0-9_%\/=\-\+\.?]+(?:&[^\s]+)?|meet/\d+\?p=[A-Za-z0-9_\-]+(?:&[^\s]+)?)"#,
                 openingModes: [.teamsApp]
             ),
 
