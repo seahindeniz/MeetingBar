@@ -227,11 +227,14 @@ extension MeetingProvider {
                     #"zoommtg://([a-z0-9-.]+)?zoom(-x)?\.(?:us|com|com\.cn|de)/join[-a-zA-Z0-9()@:%_\+.~#?&=\/]*"#
             ),
 
-            // ZoomGov
+            // ZoomGov (Zoom for Government — same product and join-URL shape as
+            // zoom.us, so the `/j/<id>?pwd=<hash>` path uses the same permissive
+            // character class as the main Zoom regex above). The previous class
+            // `[a-zA-Z0-9?&=]+` truncated `?pwd=` on `-`, `_`, `.`, `+`, `/`.
             make(
                 .zoomgov,
                 icon: "zoom_icon",
-                pattern: #"https?://([a-z0-9.]+)?zoomgov\.com/j/[a-zA-Z0-9?&=]+"#),
+                pattern: #"https?://([a-z0-9.]+)?zoomgov\.com/j/[-a-zA-Z0-9()@:%_\+.~#?&=/]+"#),
 
             // Reclaim.ai (uses Zoom links)
             make(
